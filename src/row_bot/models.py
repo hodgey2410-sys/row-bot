@@ -33,6 +33,7 @@ GOOGLE_GENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 XAI_BASE_URL = "https://api.x.ai/v1"
 MINIMAX_ANTHROPIC_BASE_URL = "https://api.minimax.io/anthropic"
 OLLAMA_CLOUD_BASE_URL = "https://ollama.com"
+ATLASCLOUD_BASE_URL = "https://api.atlascloud.ai/v1"
 
 # ── Context-size heuristics (prefix-match, checked top-to-bottom) ───────────
 # Used when the provider API doesn't expose context_length (e.g. OpenAI) and
@@ -922,6 +923,7 @@ _PROVIDER_EMOJI: dict[str | None, str] = {
     "claude_subscription": "C",
     "opencode_zen": "OZ",
     "opencode_go": "OG",
+    "atlascloud": "AC",
     "openrouter": "🌐",
     "anthropic": "🔶",
     "google": "💎",
@@ -987,6 +989,12 @@ def is_minimax_available() -> bool:
     """Return True if a MiniMax API key is configured."""
     from row_bot.api_keys import get_key
     return bool(get_key("MINIMAX_API_KEY"))
+
+
+def is_atlascloud_available() -> bool:
+    """Return True if an Atlas Cloud API key is configured."""
+    from row_bot.api_keys import get_key
+    return bool(get_key("ATLASCLOUD_API_KEY"))
 
 
 def list_cloud_models(provider: str | None = None) -> list[str]:
@@ -1443,6 +1451,30 @@ def validate_minimax_key(api_key: str) -> bool:
         return False
 
 
+def validate_atlascloud_key(api_key: str) -> bool:
+    """Validate an Atlas Cloud API key by listing OpenAI-compatible models."""
+    import httpx
+    from row_bot.providers.atlascloud import atlascloud_models_url
+
+    try:
+        resp = httpx.get(
+            atlascloud_models_url(),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            try:
+                body_json = resp.json()
+            except Exception:
+                body_json = {}
+            return isinstance(body_json.get("data"), list)
+        logger.warning("Atlas Cloud key validation: %d - %s", resp.status_code, resp.text[:200])
+        return False
+    except Exception as exc:
+        logger.warning("Atlas Cloud key validation error: %s", exc)
+        return False
+
+
 def _catalog_or_heuristic(model_id: str) -> int:
     """Resolve context size for any model via catalog → heuristic → fallback.
 
@@ -1582,6 +1614,11 @@ def fetch_cloud_models(provider: str) -> int:
         if not api_key:
             return 0
         return _fetch_opencode_models(provider)
+    elif provider == "atlascloud":
+        api_key = get_key("ATLASCLOUD_API_KEY")
+        if not api_key:
+            return 0
+        return _fetch_atlascloud_models(api_key)
     elif provider == "claude_subscription":
         return _fetch_claude_subscription_models()
     else:
@@ -1975,6 +2012,107 @@ def _fetch_xai_models(api_key: str) -> int:
     return count
 
 
+def _fetch_atlascloud_models(api_key: str) -> int:
+    """Fetch models from the Atlas Cloud OpenAI-compatible ``/v1/models`` endpoint.
+
+    Atlas Cloud exposes an OpenAI-compatible catalog, but phase 1 only admits
+    LLM chat/vision rows. Cache entries are provider-qualified because Atlas
+    IDs commonly use the same slash form as OpenRouter model IDs.
+    """
+    import httpx
+    from row_bot.providers.atlascloud import (
+        atlascloud_model_info_from_metadata,
+        atlascloud_models_url,
+        list_atlascloud_fallback_model_infos,
+    )
+    from row_bot.providers.capabilities import model_supports_surface
+    from row_bot.providers.catalog import model_info_to_cache_entry
+
+    with _cloud_cache_lock:
+        existing_atlas_rows = {
+            str(model_id): dict(info)
+            for model_id, info in _cloud_model_cache.items()
+            if isinstance(info, dict) and str(info.get("provider") or "") == "atlascloud"
+        }
+
+    source = "live"
+    data: list[dict] = []
+    try:
+        resp = httpx.get(
+            atlascloud_models_url(),
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        raw_data = resp.json().get("data", [])
+        if not isinstance(raw_data, list):
+            logger.warning("Atlas Cloud model fetch returned malformed data payload")
+            return 0
+        data = [item for item in raw_data if isinstance(item, dict)]
+    except Exception as exc:
+        if existing_atlas_rows:
+            logger.warning("Failed to fetch atlascloud models: %s; preserving previous Atlas cache", exc)
+            return 0
+        logger.warning("Failed to fetch atlascloud models: %s; using static fallback", exc)
+        source = "fallback"
+
+    verified_at = _utc_now_iso()
+    model_infos = []
+    if source == "live":
+        seen: set[str] = set()
+        for m in data:
+            mid = str(m.get("id") or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            ctx = m.get("context_length") or m.get("context_window") or _catalog_or_heuristic(mid)
+            model_info = atlascloud_model_info_from_metadata(
+                mid,
+                m,
+                display_name=str(m.get("name") or m.get("display_name") or m.get("displayName") or mid),
+                context_window=ctx,
+                source="atlascloud_live_catalog",
+                source_confidence="live_atlascloud_model_list",
+                last_verified_at=verified_at,
+            )
+            if not model_info or not model_supports_surface(model_info, "chat"):
+                continue
+            model_infos.append(model_info)
+    if not model_infos:
+        if source == "live" and data:
+            if existing_atlas_rows:
+                logger.warning("Atlas Cloud live catalog returned no usable chat models; preserving previous cache")
+                return 0
+            logger.warning("Atlas Cloud live catalog returned no usable chat models; using static fallback")
+            model_infos = list_atlascloud_fallback_model_infos()
+            source = "fallback"
+        else:
+            model_infos = list_atlascloud_fallback_model_infos()
+            source = "fallback"
+    if not model_infos:
+        return 0
+
+    if source == "fallback" and existing_atlas_rows:
+        logger.warning("Atlas Cloud fallback skipped because previous Atlas cache exists")
+        return 0
+
+    with _cloud_cache_lock:
+        stale_keys = [
+            model_id
+            for model_id, info in _cloud_model_cache.items()
+            if isinstance(info, dict) and str(info.get("provider") or "") == "atlascloud"
+        ]
+        for model_id in stale_keys:
+            _cloud_model_cache.pop(model_id, None)
+        for model_info in model_infos:
+            entry = model_info_to_cache_entry(model_info)
+            entry["source"] = "atlascloud_live_catalog" if source == "live" else "atlascloud_static_fallback"
+            _cloud_model_cache[model_info.selection_ref] = entry
+
+    logger.info("Fetched %d atlascloud models", len(model_infos))
+    return len(model_infos)
+
+
 def _fetch_minimax_models(api_key: str) -> int:
     """Populate MiniMax Anthropic-compatible models from the live provider catalog."""
     if not api_key:
@@ -2175,13 +2313,17 @@ def refresh_cloud_models() -> int:
     # Fetch context catalog first so OpenAI models get accurate sizes
     fetch_context_catalog()
     with _cloud_cache_lock:
-        preserved_minimax = {
+        preserved_rows = {
             model_id: info
             for model_id, info in _cloud_model_cache.items()
-            if isinstance(info, dict) and _is_minimax_cache_entry(str(model_id), info)
+            if isinstance(info, dict)
+            and (
+                _is_minimax_cache_entry(str(model_id), info)
+                or str(info.get("provider") or "") == "atlascloud"
+            )
         }
         _cloud_model_cache.clear()
-        _cloud_model_cache.update(preserved_minimax)
+        _cloud_model_cache.update(preserved_rows)
     total = 0
     total += fetch_cloud_models("openai")
     total += fetch_cloud_models("ollama_cloud")
@@ -2192,6 +2334,7 @@ def refresh_cloud_models() -> int:
     total += fetch_cloud_models("minimax")
     total += fetch_cloud_models("opencode_zen")
     total += fetch_cloud_models("opencode_go")
+    total += fetch_cloud_models("atlascloud")
     total += fetch_cloud_models("claude_subscription")
     _save_cloud_cache()
 
