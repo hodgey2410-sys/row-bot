@@ -39,6 +39,7 @@ from telegram.ext import (
 import row_bot.agent as agent_mod
 from row_bot.brand import APP_DISPLAY_NAME
 from row_bot.channels import commands as ch_commands
+from row_bot.channels import runtime as ch_runtime
 from row_bot.channels.base import Channel, ChannelCapabilities, ConfigField
 from row_bot.channels.auth_store import get_channel_secret
 from row_bot.threads import _save_thread_meta, _list_threads, _thread_exists
@@ -58,6 +59,11 @@ BOT_COMMANDS = [
     BotCommand("model", "Switch model (cloud/local)"),
     BotCommand("approval", "Switch approval mode"),
     BotCommand("tools", "List enabled tools"),
+    BotCommand("profiles", "List Agent Profiles"),
+    BotCommand("profile", "Show or set Agent Profile"),
+    BotCommand("agents", "Show Agent Runs"),
+    BotCommand("agent", "Start a child Agent"),
+    BotCommand("goal", "Start or control Goal Mode"),
     BotCommand("stop", "Stop the current generation"),
     BotCommand("skill", "Use a skill in this conversation"),
     BotCommand("skills", "Show active and suggested skills"),
@@ -658,6 +664,106 @@ async def _cmd_approval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(response)
 
 
+def _thread_id_for_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    config = context.chat_data.get("thread_config")
+    if config is None:
+        chat_id = update.effective_chat.id
+        config = _get_or_create_thread(chat_id)
+        context.chat_data["thread_config"] = config
+    return str((config.get("configurable") or {}).get("thread_id", ""))
+
+
+async def _cmd_profiles(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /profiles for this Telegram conversation."""
+    if not _is_authorised(update):
+        return
+    args = (update.message.text or "").split(maxsplit=1)
+    arg = args[1] if len(args) > 1 else ""
+    response = ch_commands.cmd_profiles("telegram", arg)
+    await update.message.reply_text(response)
+
+
+async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /profile for this Telegram conversation."""
+    if not _is_authorised(update):
+        return
+    thread_id = _thread_id_for_command(update, context)
+    args = (update.message.text or "").split(maxsplit=1)
+    arg = args[1] if len(args) > 1 else ""
+    response = ch_commands.cmd_profile("telegram", arg, thread_id=thread_id)
+    await update.message.reply_text(response)
+
+
+async def _cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /agents for this Telegram conversation."""
+    if not _is_authorised(update):
+        return
+    thread_id = _thread_id_for_command(update, context)
+    args = (update.message.text or "").split(maxsplit=1)
+    arg = args[1] if len(args) > 1 else ""
+    response = ch_commands.cmd_agents("telegram", arg, thread_id=thread_id)
+    await update.message.reply_text(response)
+
+
+async def _cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /agent for this Telegram conversation."""
+    if not _is_authorised(update):
+        return
+    thread_id = _thread_id_for_command(update, context)
+    enabled_tool_names = [tool.name for tool in tool_registry.get_enabled_tools()]
+    response = ch_commands.cmd_agent(
+        "telegram",
+        update.message.text or "",
+        thread_id=thread_id,
+        enabled_tool_names=enabled_tool_names,
+    )
+    await update.message.reply_text(response)
+
+
+async def _cmd_goal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /goal for this Telegram conversation."""
+    if not _is_authorised(update):
+        return
+    thread_id = _thread_id_for_command(update, context)
+    text = update.message.text or ""
+    goal_start = ch_runtime.prepare_channel_goal_start(text, thread_id)
+    if goal_start is not None:
+        chat_id = update.effective_chat.id
+        config = {"configurable": {"thread_id": thread_id}}
+        loop = asyncio.get_event_loop()
+
+        async def _goal_run_turn(prompt: str, cfg: dict):
+            return await loop.run_in_executor(None, _run_agent_sync, prompt, cfg)
+
+        async def _goal_send_text(message: str) -> None:
+            await update.effective_chat.send_message(message)
+
+        await update.effective_chat.send_message(
+            ch_runtime.format_goal_started_ack(goal_start)
+        )
+        result = await ch_runtime.run_channel_goal_async(
+            channel_name="telegram",
+            thread_id=thread_id,
+            config=config,
+            first_prompt=goal_start.prompt,
+            run_turn=_goal_run_turn,
+            send_text=_goal_send_text,
+        )
+        if result.interrupt_data:
+            with _pending_lock:
+                _pending_interrupts[chat_id] = {
+                    "data": result.interrupt_data, "config": config
+                }
+            from row_bot.channels import approval as approval_helpers
+            detail = approval_helpers.format_interrupt_text(result.interrupt_data)
+            await update.effective_chat.send_message(detail + "\nReply YES or NO.")
+        return
+    args = text.split(maxsplit=1)
+    arg = args[1] if len(args) > 1 else ""
+    response = ch_commands.cmd_goal("telegram", arg, thread_id=thread_id)
+    await update.message.reply_text(response)
+
+
 async def _cmd_tools(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /tools — list enabled tools."""
     if not _is_authorised(update):
@@ -1090,6 +1196,7 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     config = pending["config"]
     interrupt_ids = _extract_interrupt_ids(pending["data"])
+    ch_runtime.resolve_goal_approval_for_config(config, approved)
 
     # Send typing indicator
     await update.effective_chat.send_action("typing")
@@ -1155,6 +1262,42 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         html = _md_to_html(answer)
         for chunk in _split_message(html):
             await _send_html_msg(update.effective_chat, chunk)
+        thread_id = ch_runtime.thread_id_from_config(config)
+        if thread_id and answer:
+            async def _goal_run_turn(prompt: str, cfg: dict):
+                return await loop.run_in_executor(None, _run_agent_sync, prompt, cfg)
+
+            async def _goal_send_text(message: str) -> None:
+                await update.effective_chat.send_message(message)
+
+            goal_result = await ch_runtime.continue_channel_goal_after_turn_async(
+                channel_name="telegram",
+                thread_id=thread_id,
+                config=config,
+                assistant_text=answer,
+                interrupt_data=None,
+                run_turn=_goal_run_turn,
+                send_text=_goal_send_text,
+            )
+            if goal_result.interrupt_data:
+                import time as _time
+                with _pending_lock:
+                    _pending_interrupts[chat_id] = {
+                        "data": goal_result.interrupt_data,
+                        "config": config,
+                        "_ts": _time.time(),
+                    }
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("âœ… Approve", callback_data="interrupt_approve"),
+                        InlineKeyboardButton("âŒ Deny", callback_data="interrupt_deny"),
+                    ]
+                ])
+                await _send_html_msg(
+                    update.effective_chat,
+                    _format_interrupt(goal_result.interrupt_data),
+                    reply_markup=keyboard,
+                )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1361,6 +1504,11 @@ async def start_bot() -> bool:
     _app.add_handler(CommandHandler("model", _cmd_model))
     _app.add_handler(CommandHandler("approval", _cmd_approval))
     _app.add_handler(CommandHandler("tools", _cmd_tools))
+    _app.add_handler(CommandHandler("profiles", _cmd_profiles))
+    _app.add_handler(CommandHandler("profile", _cmd_profile))
+    _app.add_handler(CommandHandler("agents", _cmd_agents))
+    _app.add_handler(CommandHandler("agent", _cmd_agent))
+    _app.add_handler(CommandHandler("goal", _cmd_goal))
     _app.add_handler(CommandHandler("status", _cmd_status))
     _app.add_handler(CommandHandler("stop", _cmd_stop))
     _app.add_handler(CommandHandler("skill", _cmd_skill))

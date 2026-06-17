@@ -1404,6 +1404,16 @@ def build_developer_workspace(
                             context="developer new thread",
                         ),
                     ).props("flat dense round").tooltip("New thread")
+                    from row_bot.ui.profile_picker import build_profile_picker
+
+                    build_profile_picker(
+                        state,
+                        p=p,
+                        rebuild_main=rebuild_main,
+                        rebuild_thread_list=rebuild_thread_list,
+                        label="Profile",
+                        surface="developer",
+                    )
                     ui.select(
                         {
                             "local": "Local",
@@ -1435,6 +1445,35 @@ def build_developer_workspace(
                         ),
                     ).props("flat dense outline no-caps").classes("text-grey-4")
 
+            from row_bot.ui.agent_drawer import build_parent_agent_drawer
+
+            build_parent_agent_drawer(
+                state,
+                p,
+                rebuild_main=rebuild_main,
+                rebuild_thread_list=rebuild_thread_list,
+            )
+
+            def _refresh_goal_strip() -> None:
+                if p.goal_strip_container is None:
+                    return
+                try:
+                    from row_bot.ui.goal_ui import build_goal_progress_panel
+
+                    p.goal_strip_container.clear()
+                    with p.goal_strip_container:
+                        build_goal_progress_panel(
+                            state,
+                            p,
+                            rebuild_main=rebuild_main,
+                            send_message=send_message,
+                            surface="developer",
+                        )
+                except Exception:
+                    logger.debug("Could not refresh Developer Goal strip", exc_info=True)
+
+            p.refresh_goal_strip = _refresh_goal_strip
+
             hidden_upload = build_file_upload(p, state)
             build_chat_messages(
                 p,
@@ -1462,6 +1501,10 @@ def build_developer_workspace(
                 p,
                 new_thread=_create_new_developer_thread,
             )
+
+            p.goal_strip_container = ui.column().classes("w-full shrink-0 gap-0 row-bot-goal-strip-slot")
+            p.goal_strip_refresh_timer = ui.timer(2.0, _refresh_goal_strip)
+            _refresh_goal_strip()
 
             build_chat_input_bar(
                 p,

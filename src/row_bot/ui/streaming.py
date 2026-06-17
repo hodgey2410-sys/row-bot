@@ -33,9 +33,15 @@ from row_bot.ui.constants import (
     YT_URL_PATTERN,
     IMAGE_EXTENSIONS,
 )
-from row_bot.ui.render import autolink_urls, _auto_fence_mermaid, render_image_with_save
+from row_bot.ui.render import autolink_urls, _auto_fence_mermaid, render_agent_tool_result, render_image_with_save
 from row_bot.ui.performance import log_ui_perf
-from row_bot.ui.tool_trace import canonical_tool_name, display_tool_content, is_browser_tool_name, tool_result_failed
+from row_bot.ui.tool_trace import (
+    canonical_tool_name,
+    display_tool_content,
+    is_agent_tool_result,
+    is_browser_tool_name,
+    tool_result_failed,
+)
 from row_bot.voice.cues import (
     approval_needed_cue,
     error_cue,
@@ -54,6 +60,41 @@ logger = logging.getLogger(__name__)
 STREAM_RENDER_MIN_INTERVAL_SECONDS = 0.075
 STREAM_RENDER_MIN_CHARS = 64
 STREAM_RENDER_MAX_INTERVAL_SECONDS = 0.25
+
+
+def _profile_runtime_config_for_thread(thread_id: str) -> dict[str, Any]:
+    """Return Agent Profile runtime config for a chat thread, if one is selected."""
+    thread_id = str(thread_id or "").strip()
+    if not thread_id:
+        return {}
+    try:
+        from row_bot.agent_profiles import get_agent_profile
+        from row_bot.threads import _get_thread_agent_profile
+
+        pointer = _get_thread_agent_profile(thread_id)
+        ref = str(pointer.get("id") or pointer.get("slug") or "").strip()
+        if not ref:
+            return {}
+        profile = get_agent_profile(ref, enabled_only=True)
+        if not profile:
+            return {}
+        config: dict[str, Any] = {
+            "agent_profile_id": str(profile.get("id") or ""),
+            "agent_profile_snapshot": dict(profile),
+        }
+        tool_policy = profile.get("tool_policy_json") or {}
+        if isinstance(tool_policy, dict):
+            allow_tools = [
+                str(item).strip()
+                for item in (tool_policy.get("allow_tools") or [])
+                if str(item).strip()
+            ]
+            if allow_tools:
+                config["tool_allowlist"] = allow_tools
+        return config
+    except Exception:
+        logger.debug("Could not build Agent Profile runtime config", exc_info=True)
+        return {}
 
 
 def _client_is_live(client: Any) -> bool:
@@ -284,6 +325,7 @@ def _detach_generation(gen: GenerationState, state: AppState, reason: str) -> No
     gen.thinking_expansion = None
     gen.thinking_code = None
     gen.tool_col = None
+    gen.live_row = None
     gen.wrapper = None
     gen.pending_tools.clear()
 
@@ -295,6 +337,24 @@ def _detach_generation(gen: GenerationState, state: AppState, reason: str) -> No
         gen.tts_active = False
 
     logger.info("Detached generation for thread %s after %s", gen.thread_id, reason)
+
+
+def _delete_live_generation_row(gen: GenerationState) -> None:
+    row = getattr(gen, "live_row", None)
+    if row is None:
+        return
+    try:
+        row.delete()
+    except Exception:
+        logger.debug("Live assistant row delete failed", exc_info=True)
+    gen.live_row = None
+    gen.wrapper = None
+    gen.tool_col = None
+    gen.assistant_md = None
+    gen.thinking_label = None
+    gen.thinking_md = None
+    gen.thinking_expansion = None
+    gen.thinking_code = None
 
 
 def _handle_ui_runtime_error(
@@ -343,11 +403,25 @@ def _detach_if_ui_client_deleted(
         gen.thinking_expansion,
         gen.thinking_code,
         gen.tool_col,
+        gen.live_row,
     ):
         if handle is not None and _ui_handle_client_deleted(handle):
             _detach_generation(gen, state, reason)
             return True
     return False
+
+
+def _detach_if_thread_changed(
+    gen: GenerationState,
+    state: AppState,
+    reason: str,
+) -> bool:
+    """Detach live UI handles when the shared page switches to another thread."""
+
+    if gen.detached or state.thread_id == gen.thread_id:
+        return False
+    _detach_generation(gen, state, reason)
+    return True
 
 
 def _generation_is_terminal(gen: GenerationState) -> bool:
@@ -550,9 +624,10 @@ def _finish_live_tool_result(gen: GenerationState, tool_name: str, content: str)
             ui.label(f"#{call_no} {'failed' if failed else 'complete'}").classes(
                 f"text-xs {'text-negative' if failed else 'text-positive'}"
             )
-        display = display_tool_content(content)
-        if display:
-            ui.code(display).classes("w-full text-xs")
+        if not render_agent_tool_result({"name": tool_name, "content": content}):
+            display = display_tool_content(content)
+            if display:
+                ui.code(display).classes("w-full text-xs")
     group["failed"] = bool(group.get("failed")) or failed
     icon = "error" if group.get("failed") else ("check_circle" if group["done"] >= group["count"] else "hourglass_empty")
     prefix = "Failed" if group.get("failed") else ("Done" if icon == "check_circle" else "Running")
@@ -579,6 +654,8 @@ class _Callbacks:
         "mark_chat_message_rendered",
         "render_text_with_embeds",
         "refresh_chat_messages",
+        "refresh_parent_agent_strip",
+        "refresh_goal_strip",
     )
 
     def __init__(self) -> None:
@@ -589,9 +666,581 @@ class _Callbacks:
 Callbacks = _Callbacks  # public alias for wiring in app
 
 
+def _refresh_parent_agent_strip(cb: Any) -> None:
+    refresh = getattr(cb, "refresh_parent_agent_strip", None)
+    if not callable(refresh):
+        return
+    try:
+        refresh()
+    except Exception:
+        logger.debug("Parent Agent strip refresh failed", exc_info=True)
+
+
+def _schedule_parent_agent_strip_refresh(cb: Any) -> None:
+    _refresh_parent_agent_strip(cb)
+    for delay in (0.75, 2.0, 4.0):
+        try:
+            ui.timer(delay, lambda cb=cb: _refresh_parent_agent_strip(cb), once=True)
+        except Exception:
+            logger.debug("Parent Agent strip delayed refresh scheduling failed", exc_info=True)
+            break
+
+
+def _refresh_goal_strip(cb: Any) -> None:
+    refresh = getattr(cb, "refresh_goal_strip", None)
+    if not callable(refresh):
+        return
+    try:
+        refresh()
+    except Exception:
+        logger.debug("Goal strip refresh failed", exc_info=True)
+
+
+def _schedule_goal_strip_refresh(cb: Any) -> None:
+    _refresh_goal_strip(cb)
+    for delay in (0.25, 1.0, 3.0, 5.0):
+        try:
+            ui.timer(delay, lambda cb=cb: _refresh_goal_strip(cb), once=True)
+        except Exception:
+            logger.debug("Goal strip delayed refresh scheduling failed", exc_info=True)
+            break
+
+
+def _rebuild_goal_surface(cb: Any, *, reason: str) -> None:
+    rebuild = getattr(cb, "rebuild_main", None)
+    if not callable(rebuild):
+        return
+    try:
+        rebuild(immediate=True, reason=reason)
+    except TypeError:
+        try:
+            rebuild()
+        except Exception:
+            logger.debug("Goal surface rebuild failed", exc_info=True)
+    except Exception:
+        logger.debug("Goal surface rebuild failed", exc_info=True)
+
+
+def _schedule_goal_surface_refresh(cb: Any, *, reason: str) -> None:
+    _schedule_goal_strip_refresh(cb)
+    _rebuild_goal_surface(cb, reason=reason)
+
+
+def _looks_like_new_agent_request(text: str) -> bool:
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return False
+    agent_terms = (
+        "use an agent",
+        "use another agent",
+        "spawn an agent",
+        "spawn another agent",
+        "start an agent",
+        "start another agent",
+        "delegate",
+        "subagent",
+        "child agent",
+    )
+    return any(term in normalized for term in agent_terms)
+
+
+def _queued_control_message(
+    text: str,
+    *,
+    kind: str,
+    status: str,
+    label: str,
+    agent_run_id: str = "",
+    agent_name: str = "",
+    message_id: str | None = None,
+) -> dict:
+    return {
+        "role": "user",
+        "content": str(text or "").strip(),
+        "timestamp": datetime.now().strftime("%H:%M"),
+        "queued_control": {
+            "id": message_id or uuid.uuid4().hex[:12],
+            "kind": str(kind or "follow_up"),
+            "status": str(status or "queued_parent_turn"),
+            "label": str(label or "Queued"),
+            "agent_run_id": str(agent_run_id or ""),
+            "agent_name": str(agent_name or ""),
+        },
+    }
+
+
+def _queued_control_ids(messages: list[dict], ids: list[str] | None) -> set[str]:
+    return {str(item) for item in (ids or []) if str(item or "").strip()}
+
+
+def _queued_id_set(ids: list[str] | None) -> set[str]:
+    return {str(item) for item in (ids or []) if str(item or "").strip()}
+
+
+def _queued_control_id(msg: dict) -> str:
+    queued = msg.get("queued_control")
+    if not isinstance(queued, dict):
+        return ""
+    return str(queued.get("id") or "").strip()
+
+
+def _is_parent_turn_queued_control(msg: dict) -> bool:
+    queued = msg.get("queued_control")
+    if not isinstance(queued, dict):
+        return False
+    return str(queued.get("status") or "") in {
+        "queued_parent_turn",
+        "dispatching",
+    }
+
+
+def _turn_boundary_generation_id(msg: dict) -> str:
+    boundary = msg.get("turn_boundary")
+    if not isinstance(boundary, dict):
+        return ""
+    return str(boundary.get("after_generation_id") or "").strip()
+
+
+def _is_future_parent_turn_boundary(
+    msg: dict,
+    *,
+    current_queued_ids: set[str],
+    current_generation_id: str = "",
+) -> bool:
+    if _is_parent_turn_queued_control(msg):
+        queued_id = _queued_control_id(msg)
+        return not (queued_id and queued_id in current_queued_ids)
+    generation_id = _turn_boundary_generation_id(msg)
+    return bool(current_generation_id and generation_id == current_generation_id)
+
+
+def _mark_queued_controls_dispatching(messages: list[dict], ids: list[str] | None) -> bool:
+    id_set = _queued_control_ids(messages, ids)
+    if not id_set:
+        return False
+    changed = False
+    for msg in messages:
+        queued = msg.get("queued_control")
+        if not isinstance(queued, dict):
+            continue
+        if str(queued.get("id") or "") not in id_set:
+            continue
+        queued["status"] = "dispatching"
+        queued["label"] = "Sent after current response"
+        changed = True
+    return changed
+
+
+def _settle_queued_controls(messages: list[dict], ids: list[str] | None) -> bool:
+    id_set = _queued_id_set(ids)
+    if not id_set:
+        return False
+    changed = False
+    for msg in messages:
+        queued_id = _queued_control_id(msg)
+        if queued_id and queued_id in id_set and "queued_control" in msg:
+            msg.pop("queued_control", None)
+            changed = True
+    return changed
+
+
+def _insert_assistant_before_future_queued_turns(
+    messages: list[dict],
+    assistant_msg: dict,
+    *,
+    current_queued_ids: list[str] | None = None,
+    current_generation_id: str = "",
+) -> int:
+    current_ids = _queued_id_set(current_queued_ids)
+    insert_at = len(messages)
+    for idx, msg in enumerate(messages):
+        if _is_future_parent_turn_boundary(
+            msg,
+            current_queued_ids=current_ids,
+            current_generation_id=current_generation_id,
+        ):
+            insert_at = idx
+            break
+    messages.insert(insert_at, assistant_msg)
+    return insert_at
+
+
+def _append_visible_queued_control(
+    *,
+    state: AppState,
+    cb: _Callbacks,
+    text: str,
+    kind: str,
+    status: str,
+    label: str,
+    agent_run_id: str = "",
+    agent_name: str = "",
+) -> str:
+    msg = _queued_control_message(
+        text,
+        kind=kind,
+        status=status,
+        label=label,
+        agent_run_id=agent_run_id,
+        agent_name=agent_name,
+    )
+    state.messages.append(msg)
+    state.cache_active_messages()
+    if cb.add_chat_message:
+        cb.add_chat_message(msg)
+    return str((msg.get("queued_control") or {}).get("id") or "")
+
+
+def _single_steering_target(parent_thread_id: str) -> dict | None:
+    if not parent_thread_id:
+        return None
+    try:
+        from row_bot.agent_runs import list_agent_runs
+
+        queued = list_agent_runs(
+            parent_thread_id=parent_thread_id,
+            statuses=["queued", "waiting_user"],
+            kind="subagent",
+            limit=4,
+        )
+        if len(queued) == 1:
+            return queued[0]
+        if queued:
+            return None
+        running = list_agent_runs(
+            parent_thread_id=parent_thread_id,
+            statuses=["running"],
+            kind="subagent",
+            limit=4,
+        )
+        if len(running) == 1:
+            return running[0]
+    except Exception:
+        logger.debug("Could not resolve active-run steering target", exc_info=True)
+    return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # CONSUME GENERATION
 # ══════════════════════════════════════════════════════════════════════
+
+_DIRECT_AGENT_TERMINAL_STATUSES = {
+    "completed",
+    "completed_delivery_failed",
+    "failed",
+    "stopped",
+    "blocked",
+    "timed_out",
+    "cancelled",
+}
+
+
+def _agent_run_card_refresh_key(run_row: dict | None) -> str:
+    if not run_row:
+        return "missing"
+    return "|".join(
+        [
+            str(run_row.get("id") or ""),
+            str(run_row.get("status") or ""),
+            str(run_row.get("status_message") or ""),
+            str(run_row.get("summary") or ""),
+            str(run_row.get("error") or ""),
+            str(run_row.get("turns_used") or 0),
+            str(run_row.get("finished_at") or ""),
+            str(run_row.get("updated_at") or ""),
+            str(run_row.get("stop_requested") or 0),
+        ]
+    )
+
+
+def _refresh_key_for_agent_run_ids(run_ids: list[str]) -> str:
+    if not run_ids:
+        return ""
+    try:
+        from row_bot.agent_runs import get_agent_run
+
+        return ";".join(_agent_run_card_refresh_key(get_agent_run(run_id)) for run_id in run_ids)
+    except Exception:
+        logger.debug("Could not build Agent Run card refresh key", exc_info=True)
+        return ""
+
+
+def _direct_agent_thread_messages(state: AppState, thread_id: str) -> list[dict]:
+    if state.thread_id == thread_id:
+        return state.messages
+    cached = state.message_cache.get(thread_id)
+    if cached is not None:
+        return cached
+    try:
+        from row_bot.ui.helpers import load_thread_messages
+
+        messages = load_thread_messages(thread_id)
+        state.message_cache[thread_id] = list(messages)
+        state.message_cache_dirty.discard(thread_id)
+        return messages
+    except Exception:
+        logger.debug("Could not load parent thread messages for Agent refresh", exc_info=True)
+        return []
+
+
+def _update_direct_agent_refresh_keys(messages: list[dict], run_ids: list[str]) -> tuple[bool, bool]:
+    clean_ids = [str(run_id) for run_id in run_ids if str(run_id or "").strip()]
+    if not clean_ids:
+        return False, True
+    key = _refresh_key_for_agent_run_ids(clean_ids)
+    if not key:
+        return False, False
+    changed = False
+    id_set = set(clean_ids)
+    for msg in messages:
+        msg_ids = {str(item) for item in (msg.get("agent_run_ids") or []) if str(item or "").strip()}
+        if not msg_ids or not (msg_ids & id_set):
+            continue
+        if msg.get("agent_run_refresh_key") != key:
+            msg["agent_run_refresh_key"] = key
+            changed = True
+    try:
+        from row_bot.agent_runs import get_agent_run
+
+        rows = [get_agent_run(run_id) for run_id in clean_ids]
+        terminal = all(
+            (not row) or str(row.get("status") or "") in _DIRECT_AGENT_TERMINAL_STATUSES
+            for row in rows
+        )
+    except Exception:
+        terminal = False
+    return changed, terminal
+
+
+def _direct_agent_start_ack(run_row: dict | None, request: Any) -> str:
+    profile = str(
+        (run_row or {}).get("profile_display_name")
+        or (run_row or {}).get("profile_slug")
+        or getattr(request, "profile_slug", "")
+        or "Worker"
+    ).strip()
+    if profile:
+        profile = profile[:1].upper() + profile[1:]
+    else:
+        profile = "Worker"
+    return f"Started a {profile} agent for this. I'll keep this thread updated."
+
+
+def _direct_agent_terminal_summary(run_row: dict | None) -> str:
+    if not run_row:
+        return ""
+    status = str(run_row.get("status") or "").strip().lower()
+    if status not in _DIRECT_AGENT_TERMINAL_STATUSES:
+        return ""
+    name = str(run_row.get("display_name") or run_row.get("id") or "Agent").strip()
+    detail = str(
+        run_row.get("summary")
+        or run_row.get("status_message")
+        or run_row.get("error")
+        or ""
+    ).strip()
+    if status in {"completed", "completed_delivery_failed"}:
+        prefix = f"Done. {name} completed."
+    elif status == "stopped":
+        prefix = f"{name} was stopped."
+    elif status == "cancelled":
+        prefix = f"{name} was cancelled."
+    elif status == "timed_out":
+        prefix = f"{name} timed out."
+    elif status == "blocked":
+        prefix = f"{name} is blocked."
+    else:
+        prefix = f"{name} failed."
+    if detail:
+        if detail.lower().startswith(prefix.lower()):
+            return detail
+        return f"{prefix}\n\n{detail}"
+    return prefix
+
+
+def _append_direct_agent_completion_messages(messages: list[dict], run_ids: list[str]) -> bool:
+    clean_ids = {str(run_id) for run_id in run_ids if str(run_id or "").strip()}
+    if not clean_ids:
+        return False
+    try:
+        from row_bot.agent_runs import get_agent_run
+    except Exception:
+        logger.debug("Could not import Agent Run store for completion summary", exc_info=True)
+        return False
+
+    changed = False
+    for msg in list(messages):
+        lifecycle = msg.get("agent_lifecycle")
+        if not isinstance(lifecycle, dict):
+            continue
+        if str(lifecycle.get("kind") or "") != "direct_agent_spawn":
+            continue
+        run_id = str(lifecycle.get("run_id") or "").strip()
+        if run_id not in clean_ids or lifecycle.get("completion_summary_emitted"):
+            continue
+        try:
+            run_row = get_agent_run(run_id)
+        except Exception:
+            logger.debug("Could not load Agent Run %s for completion summary", run_id, exc_info=True)
+            continue
+        summary = _direct_agent_terminal_summary(run_row)
+        if not summary:
+            continue
+        lifecycle["completion_summary_emitted"] = True
+        lifecycle["completed_status"] = str((run_row or {}).get("status") or "")
+        messages.append(
+            {
+                "role": "assistant",
+                "content": summary,
+                "timestamp": datetime.now().strftime("%H:%M"),
+                "agent_completion_for": run_id,
+            }
+        )
+        changed = True
+    return changed
+
+
+def _schedule_direct_agent_card_refresh(
+    *,
+    state: AppState,
+    cb: _Callbacks,
+    thread_id: str,
+    run_ids: list[str],
+) -> None:
+    clean_ids = [str(run_id) for run_id in run_ids if str(run_id or "").strip()]
+    if not clean_ids:
+        return
+    attempts = {"count": 0}
+    timer_ref: dict[str, Any] = {"timer": None}
+
+    def _tick() -> None:
+        attempts["count"] += 1
+        messages = _direct_agent_thread_messages(state, thread_id)
+        changed, terminal = _update_direct_agent_refresh_keys(messages, clean_ids)
+        summary_changed = _append_direct_agent_completion_messages(messages, clean_ids)
+        if changed or summary_changed:
+            try:
+                from row_bot.ui.helpers import persist_thread_media_state
+
+                persist_thread_media_state(thread_id, messages)
+            except Exception:
+                logger.debug("Direct Agent card refresh persistence failed", exc_info=True)
+            if state.thread_id == thread_id:
+                state.messages = messages
+                state.cache_active_messages()
+                try:
+                    cb.refresh_chat_messages()
+                except Exception:
+                    logger.debug("Direct Agent card transcript refresh failed", exc_info=True)
+            else:
+                state.message_cache[thread_id] = list(messages)
+                state.message_cache_dirty.discard(thread_id)
+        _refresh_parent_agent_strip(cb)
+        if terminal or attempts["count"] >= 240:
+            timer_obj = timer_ref.get("timer")
+            if timer_obj is not None:
+                try:
+                    timer_obj.deactivate()
+                except Exception:
+                    logger.debug("Direct Agent card refresh timer deactivate failed", exc_info=True)
+
+    try:
+        from row_bot.ui.timer_utils import safe_timer
+
+        timer_ref["timer"] = safe_timer(1.0, _tick)
+    except Exception:
+        logger.debug("Direct Agent card refresh scheduling failed", exc_info=True)
+
+
+async def _handle_direct_agent_spawn(
+    request: Any,
+    *,
+    state: AppState,
+    p: P,
+    cb: _Callbacks,
+    original_text: str,
+    enabled_tool_names: list[str],
+    active_generation_id: str = "",
+) -> None:
+    from row_bot.agent_commands import spawn_agent_from_request
+    from row_bot.threads import touch_thread
+    from row_bot.ui.helpers import persist_thread_media_state
+
+    parent_thread_id = str(state.thread_id or "")
+    if not parent_thread_id:
+        return
+    parent_messages = state.messages
+    timestamp = datetime.now().strftime("%H:%M")
+    user_msg: dict = {
+        "role": "user",
+        "content": str(original_text or "").strip(),
+        "timestamp": timestamp,
+    }
+    if active_generation_id:
+        user_msg["turn_boundary"] = {"after_generation_id": active_generation_id}
+    run_id = ""
+    try:
+        run_row = await run.io_bound(
+            lambda: spawn_agent_from_request(
+                parent_thread_id,
+                request,
+                enabled_tool_names=enabled_tool_names,
+            )
+        )
+        run_id = str((run_row or {}).get("id") or "").strip()
+        assistant_msg: dict = {
+            "role": "assistant",
+            "content": _direct_agent_start_ack(run_row, request),
+            "timestamp": timestamp,
+            "agent_run_ids": [run_id] if run_id else [],
+            "agent_run_refresh_key": _agent_run_card_refresh_key(run_row),
+            "agent_lifecycle": {
+                "kind": "direct_agent_spawn",
+                "run_id": run_id,
+                "completion_summary_emitted": False,
+            },
+        }
+    except Exception as exc:
+        logger.warning("Direct Agent spawn failed: %s", exc, exc_info=True)
+        assistant_msg = {
+            "role": "assistant",
+            "content": f"Could not start Agent: {exc}",
+            "timestamp": timestamp,
+        }
+
+    parent_messages.extend([user_msg, assistant_msg])
+    persist_thread_media_state(parent_thread_id, parent_messages)
+    if state.thread_id == parent_thread_id:
+        state.cache_active_messages()
+        if cb.add_chat_message:
+            cb.add_chat_message(user_msg)
+            cb.add_chat_message(assistant_msg)
+    else:
+        state.message_cache[parent_thread_id] = list(parent_messages)
+        state.message_cache_dirty.discard(parent_thread_id)
+    touch_thread(parent_thread_id)
+    _schedule_parent_agent_strip_refresh(cb)
+    if run_id:
+        _schedule_direct_agent_card_refresh(
+            state=state,
+            cb=cb,
+            thread_id=parent_thread_id,
+            run_ids=[run_id],
+        )
+        try:
+            ui.notify("Agent started.", type="info", close_button=True, timeout=3000)
+        except Exception:
+            logger.debug("Direct Agent spawn notification failed", exc_info=True)
+    try:
+        cb.rebuild_thread_list()
+    except Exception:
+        logger.debug("Direct Agent spawn thread list refresh failed", exc_info=True)
+    if state.thread_id == parent_thread_id and p.chat_scroll:
+        try:
+            p.chat_scroll.scroll_to(percent=1.0)
+        except Exception:
+            logger.debug("Direct Agent spawn scroll failed", exc_info=True)
+
 
 async def consume_generation(
     gen: GenerationState,
@@ -956,6 +1605,7 @@ async def consume_generation(
 
     try:
       while True:
+        _detach_if_thread_changed(gen, state, "active thread changed")
         # ── Stop handling ────────────────────────────────────────────
         if gen.stop_event.is_set() and not _stopped_shown:
             _stopped_shown = True
@@ -1096,6 +1746,8 @@ async def consume_generation(
         elif event_type == "tool_call":
             _buddy(BuddyEventType.TOOL_STARTED, "Using a tool", tool=str(payload))
             _voice_diag("generation_event:tool_call", tool=str(payload))
+            if str(payload or "").strip().lower() in {"agents", "delegate_work", "agent_wait", "agent_status"}:
+                _schedule_parent_agent_strip_refresh(cb)
             if gen.voice_mode and state.voice_coordinator.transport == "realtime":
                 realtime_tool_events_since_cue += 1
                 state.voice_coordinator.mark_realtime_latency("row_bot_tool_started")
@@ -1385,14 +2037,44 @@ async def consume_generation(
         if gen.captured_videos:
             a_msg["videos"] = gen.captured_videos
         if state.thread_id == gen.thread_id:
-            state.messages.append(a_msg)
+            inserted_idx = _insert_assistant_before_future_queued_turns(
+                state.messages,
+                a_msg,
+                current_queued_ids=gen.queued_message_ids,
+                current_generation_id=gen.generation_id,
+            )
+            settled_queued_controls = _settle_queued_controls(
+                state.messages,
+                gen.queued_message_ids,
+            )
             persist_thread_media_state(state.thread_id, state.messages)
             state.cache_active_messages()
-            if not gen.detached and cb.mark_chat_message_rendered:
+            inserted_at_tail = inserted_idx == len(state.messages) - 1
+            has_agent_tool_results = any(
+                isinstance(item, dict) and is_agent_tool_result(item)
+                for item in (gen.tool_results or [])
+            )
+            needs_transcript_reconcile = (
+                (not inserted_at_tail)
+                or settled_queued_controls
+                or has_agent_tool_results
+            )
+            if (
+                not gen.detached
+                and cb.mark_chat_message_rendered
+                and not needs_transcript_reconcile
+            ):
                 try:
                     cb.mark_chat_message_rendered(a_msg)
                 except Exception:
                     logger.debug("Final assistant render-state mark failed", exc_info=True)
+            elif not gen.detached:
+                try:
+                    if has_agent_tool_results:
+                        _delete_live_generation_row(gen)
+                    cb.refresh_chat_messages()
+                except Exception:
+                    logger.debug("Final assistant queued-turn transcript refresh failed", exc_info=True)
             _persisted_detached = True
         else:
             _has_detached_media = bool(gen.captured_images or gen.captured_videos)
@@ -1415,6 +2097,14 @@ async def consume_generation(
                     "Detached generation for thread %s completed but media sidecar persistence did not attach anything",
                     gen.thread_id,
                 )
+    elif state.thread_id == gen.thread_id and gen.queued_message_ids:
+        if _settle_queued_controls(state.messages, gen.queued_message_ids):
+            state.cache_active_messages()
+            if not gen.detached:
+                try:
+                    cb.refresh_chat_messages()
+                except Exception:
+                    logger.debug("Empty queued-turn transcript refresh failed", exc_info=True)
 
     # Cleanup
     queued_voice_controls = list(getattr(gen, "voice_control_queue", []) or [])
@@ -1498,11 +2188,83 @@ async def consume_generation(
         except Exception:
             logger.debug("Developer inspector final refresh scheduling failed", exc_info=True)
 
+    goal_continuation_prompt = ""
+    if (
+        (gen.status == "done" or gen.interrupt_data)
+        and (_has_final_output or gen.interrupt_data)
+        and not gen.stop_event.is_set()
+    ):
+        try:
+            from row_bot import goals
+
+            configurable = gen.config.get("configurable", {}) if isinstance(gen.config, dict) else {}
+            model_override = str(configurable.get("model_override") or "")
+            decision = await run.io_bound(
+                lambda: goals.after_turn(
+                    thread_id=gen.thread_id,
+                    turn_id=gen.generation_id or f"{gen.thread_id}:{id(gen)}",
+                    assistant_text=gen.accumulated,
+                    model_override=model_override,
+                    pending_approval=bool(gen.interrupt_data),
+                )
+            )
+            if decision.should_continue and decision.continuation_prompt:
+                goal_continuation_prompt = decision.continuation_prompt
+            refresh_goal = decision.goal
+            if refresh_goal is None:
+                refresh_goal = await run.io_bound(
+                    lambda: goals.get_current_goal(gen.thread_id, include_terminal=True)
+                )
+            if refresh_goal and state.thread_id == gen.thread_id and not gen.detached:
+                _schedule_goal_strip_refresh(cb)
+        except Exception:
+            logger.debug("Goal Mode post-turn evaluation failed", exc_info=True)
+
+    if state.thread_id == gen.thread_id and not gen.detached:
+        _schedule_goal_strip_refresh(cb)
+
+    if state.thread_id == gen.thread_id and not gen.detached:
+        try:
+            from row_bot import goals
+
+            visible_goal = await run.io_bound(
+                lambda: goals.get_current_goal(gen.thread_id, include_terminal=True)
+            )
+            if visible_goal:
+                _schedule_goal_surface_refresh(
+                    cb,
+                    reason=f"goal_visible_final_{str(visible_goal.get('status') or 'updated')}",
+                )
+        except Exception:
+            logger.debug("Goal visible final surface refresh failed", exc_info=True)
+
+    if goal_continuation_prompt and state.thread_id == gen.thread_id and not gen.detached:
+        logger.info(
+            "Goal Mode continuation dispatch for thread %s",
+            gen.thread_id[:8] if gen.thread_id else "?",
+        )
+        asyncio.create_task(
+            send_message(
+                goal_continuation_prompt,
+                state=state,
+                p=p,
+                cb=cb,
+                voice_mode=gen.voice_mode,
+                internal_goal_continuation=True,
+            )
+        )
+        queued_voice_controls = []
+
     if queued_voice_controls and state.thread_id == gen.thread_id and not gen.detached:
         follow_ups = [
             str(item.get("text") or "").strip()
             for item in queued_voice_controls
             if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+        pending_ids = [
+            str(item.get("pending_message_id") or "").strip()
+            for item in queued_voice_controls
+            if isinstance(item, dict) and str(item.get("pending_message_id") or "").strip()
         ]
         if follow_ups:
             follow_up_text = "\n".join(follow_ups)
@@ -1522,6 +2284,7 @@ async def consume_generation(
                     p=p,
                     cb=cb,
                     voice_mode=gen.voice_mode,
+                    queued_message_ids=pending_ids,
                 )
             )
 
@@ -1707,11 +2470,12 @@ async def _handle_tool_done(
                 matched_exp._text = f"{'Failed' if failed else 'Done'} {tool_name}"
                 matched_exp.update()
                 if tool_content:
-                    display = tool_content[:5_000]
-                    if len(tool_content) > 5_000:
-                        display += "\n\n\u2026 (truncated)"
                     with matched_exp:
-                        ui.code(display).classes("w-full text-xs")
+                        if not render_agent_tool_result({"name": tool_name, "content": tool_content}):
+                            display = tool_content[:5_000]
+                            if len(tool_content) > 5_000:
+                                display += "\n\n\u2026 (truncated)"
+                            ui.code(display).classes("w-full text-xs")
             else:
                 with gen.tool_col:
                     with ui.expansion(
@@ -1719,15 +2483,25 @@ async def _handle_tool_done(
                         icon="error" if failed else "check_circle",
                     ).classes("w-full"):
                         if tool_content:
-                            display = tool_content[:5_000]
-                            if len(tool_content) > 5_000:
-                                display += "\n\n\u2026 (truncated)"
-                            ui.code(display).classes("w-full text-xs")
+                            if not render_agent_tool_result({"name": tool_name, "content": tool_content}):
+                                display = tool_content[:5_000]
+                                if len(tool_content) > 5_000:
+                                    display += "\n\n\u2026 (truncated)"
+                                ui.code(display).classes("w-full text-xs")
         except Exception as exc:
             _handle_ui_runtime_error(gen, state, exc, "tool expansion update")
             logger.debug("Tool expansion update failed for %s", tool_name, exc_info=True)
 
-    gen.tool_results.append({"name": tool_name, "content": tool_content, "error": failed})
+    tool_result = {"name": tool_name, "content": tool_content, "error": failed}
+    gen.tool_results.append(tool_result)
+    if is_agent_tool_result(tool_result):
+        _refresh_parent_agent_strip(cb)
+    if (
+        raw_tool_name in ("goal_update", "goal_status")
+        or "goal" in str(raw_tool_name).lower()
+        or "goal" in str(tool_name).lower()
+    ):
+        _schedule_goal_strip_refresh(cb)
 
     # Vision capture
     if raw_tool_name in ("analyze_image",) or tool_name == "\U0001f441\ufe0f Vision":
@@ -1843,6 +2617,8 @@ async def send_message(
     p: P,
     cb: _Callbacks,
     voice_mode: bool = False,
+    queued_message_ids: list[str] | None = None,
+    internal_goal_continuation: bool = False,
 ) -> None:
     """Send a message and stream the agent response."""
     from row_bot.agent import stream_agent, repair_orphaned_tool_calls, recursion_limit_for_mode
@@ -1857,9 +2633,94 @@ async def send_message(
 
     if not text.strip() and not p.pending_files:
         return
+    direct_agent_request = None
+    direct_agent_command_text = False
+    if not internal_goal_continuation and not p.pending_files:
+        try:
+            from row_bot.agent_commands import is_agent_spawn_command, parse_agent_spawn_text
+
+            direct_agent_command_text = is_agent_spawn_command(text)
+            direct_agent_request = await run.io_bound(lambda: parse_agent_spawn_text(text))
+        except Exception:
+            logger.debug("Could not parse direct Agent request", exc_info=True)
+
+    def _direct_spawn_enabled_tools() -> list[str]:
+        names = [tool.name for tool in tool_registry.get_enabled_tools()]
+        if getattr(state, "active_developer_workspace_id", None):
+            try:
+                from row_bot.developer.profile import effective_tool_names
+
+                names = effective_tool_names(names)
+            except Exception:
+                logger.debug("Could not apply Developer tool profile to direct Agent spawn", exc_info=True)
+        return names
+
     if state.thread_id and state.thread_id in _active_generations:
         if not _drop_terminal_active_generation(state.thread_id):
+            active_gen = _active_generations.get(state.thread_id)
+            if direct_agent_request is not None:
+                await _handle_direct_agent_spawn(
+                    direct_agent_request,
+                    state=state,
+                    p=p,
+                    cb=cb,
+                    original_text=text,
+                    enabled_tool_names=_direct_spawn_enabled_tools(),
+                    active_generation_id=str(getattr(active_gen, "generation_id", "") or ""),
+                )
+                return
+            if direct_agent_command_text:
+                from row_bot.agent_commands import format_agent_spawn_usage
+
+                user_msg = {"role": "user", "content": text}
+                assistant_msg = {"role": "assistant", "content": format_agent_spawn_usage()}
+                state.messages.extend([user_msg, assistant_msg])
+                persist_thread_media_state(state.thread_id, state.messages)
+                state.cache_active_messages()
+                cb.add_chat_message(user_msg)
+                cb.add_chat_message(assistant_msg)
+                touch_thread(state.thread_id)
+                return
+            from row_bot.voice.actions import classify_active_run_control
             from row_bot.voice.agent_bridge import VoiceAgentBridge
+
+            control_kind = classify_active_run_control(text)
+            if (
+                control_kind == "steer"
+                and not _looks_like_new_agent_request(text)
+            ):
+                target = await run.io_bound(lambda: _single_steering_target(str(state.thread_id or "")))
+                if target:
+                    target_status = str(target.get("status") or "")
+                    target_name = str(target.get("display_name") or target.get("id") or "Agent")
+                    run_id = str(target.get("id") or "")
+                    if target_status in {"queued", "waiting_user"}:
+                        label = f"Added to {target_name} before it starts"
+                        queued_status = "queued_agent_message"
+                    else:
+                        label = f"Recorded for {target_name}; active calls cannot be interrupted"
+                        queued_status = "running_agent_message"
+                    _append_visible_queued_control(
+                        state=state,
+                        cb=cb,
+                        text=text,
+                        kind=control_kind,
+                        status=queued_status,
+                        label=label,
+                        agent_run_id=run_id,
+                        agent_name=target_name,
+                    )
+                    try:
+                        from row_bot.tools import agent_tool as _agent_tool
+
+                        await run.io_bound(lambda: _agent_tool._agent_message(run_id, text))
+                    except Exception:
+                        logger.debug("Could not record active-run child steering", exc_info=True)
+                    try:
+                        ui.notify(label, type="info", close_button=True, timeout=4000)
+                    except Exception:
+                        logger.debug("Active-run child steering notification failed", exc_info=True)
+                    return
 
             bridge = VoiceAgentBridge(
                 send_message=lambda *args, **kwargs: None,
@@ -1867,6 +2728,21 @@ async def send_message(
             )
             control = bridge.control_active_run(text)
             if control.get("handled"):
+                pending_id = ""
+                if control_kind in {"follow_up", "steer"}:
+                    pending_id = _append_visible_queued_control(
+                        state=state,
+                        cb=cb,
+                        text=text,
+                        kind=control_kind,
+                        status="queued_parent_turn",
+                        label="Queued as your next chat message",
+                    )
+                    gen = _active_generations.get(state.thread_id)
+                    control_queue = getattr(gen, "voice_control_queue", None) if gen else None
+                    if control_queue and isinstance(control_queue[-1], dict):
+                        control_queue[-1]["pending_message_id"] = pending_id
+                        control_queue[-1]["queued_label"] = "Queued as your next chat message"
                 speakable = str(control.get("speakable") or "")
                 if speakable:
                     logger.info(
@@ -1876,6 +2752,7 @@ async def send_message(
                             "thread_id": state.thread_id,
                             "control": control.get("control"),
                             "speakable": speakable,
+                            "pending_message_id": pending_id,
                         },
                     )
                     try:
@@ -1914,35 +2791,101 @@ async def send_message(
         cb.rebuild_thread_list()
 
     gen_thread_id = state.thread_id
+    goal_agent_input_override: str | None = None
+    queued_visible_user_msg = False
+    if queued_message_ids:
+        queued_visible_user_msg = _mark_queued_controls_dispatching(
+            state.messages,
+            queued_message_ids,
+        )
+        if queued_visible_user_msg:
+            state.cache_active_messages()
+            try:
+                cb.refresh_chat_messages()
+            except Exception:
+                logger.debug("Queued control transcript refresh failed", exc_info=True)
 
-    if text.strip().startswith("/") and not p.pending_files:
-        from row_bot.slash_commands import dispatch_text_command
+    if direct_agent_request is not None and not p.pending_files:
+        await _handle_direct_agent_spawn(
+            direct_agent_request,
+            state=state,
+            p=p,
+            cb=cb,
+            original_text=text,
+            enabled_tool_names=_direct_spawn_enabled_tools(),
+        )
+        return
+
+    if not internal_goal_continuation and text.strip().startswith("/") and not p.pending_files:
+        from row_bot.slash_commands import dispatch_text_command, resolve_command_text
 
         enabled_tool_names = [t.name for t in tool_registry.get_enabled_tools()]
-        command_response = await run.io_bound(
-            lambda: dispatch_text_command(
-                gen_thread_id,
-                text,
-                enabled_tool_names=enabled_tool_names,
-            )
-        )
-        if command_response is not None:
-            user_msg = {"role": "user", "content": text}
-            assistant_msg = {"role": "assistant", "content": command_response}
-            state.messages.extend([user_msg, assistant_msg])
-            persist_thread_media_state(state.thread_id, state.messages)
-            state.cache_active_messages()
-            cb.add_chat_message(user_msg)
-            cb.add_chat_message(assistant_msg)
-            touch_thread(state.thread_id)
-            try:
-                cb.rebuild_main()
-            except TypeError:
-                pass
-            return
+        resolved_command = await run.io_bound(lambda: resolve_command_text(text, include_skills=True))
+        if resolved_command is not None:
+            spec, arg = resolved_command
+            if spec.id == "goal":
+                from row_bot import goals
+
+                if await run.io_bound(lambda: goals.is_goal_start_argument(arg)):
+                    goal = await run.io_bound(lambda: goals.start_goal(gen_thread_id, arg))
+                    goal_agent_input_override = goals.build_initial_goal_prompt(goal)
+                    _schedule_goal_strip_refresh(cb)
+                else:
+                    command_response = await run.io_bound(
+                        lambda: dispatch_text_command(
+                            gen_thread_id,
+                            text,
+                            enabled_tool_names=enabled_tool_names,
+                        )
+                    )
+                    if command_response is not None:
+                        user_msg = {"role": "user", "content": text}
+                        assistant_msg = {"role": "assistant", "content": command_response}
+                        if queued_visible_user_msg:
+                            state.messages.append(assistant_msg)
+                        else:
+                            state.messages.extend([user_msg, assistant_msg])
+                        persist_thread_media_state(state.thread_id, state.messages)
+                        state.cache_active_messages()
+                        if not queued_visible_user_msg:
+                            cb.add_chat_message(user_msg)
+                        cb.add_chat_message(assistant_msg)
+                        touch_thread(state.thread_id)
+                        try:
+                            _schedule_goal_strip_refresh(cb)
+                            cb.rebuild_main()
+                        except TypeError:
+                            pass
+                        return
+            else:
+                command_response = await run.io_bound(
+                    lambda: dispatch_text_command(
+                        gen_thread_id,
+                        text,
+                        enabled_tool_names=enabled_tool_names,
+                    )
+                )
+                if command_response is not None:
+                    user_msg = {"role": "user", "content": text}
+                    assistant_msg = {"role": "assistant", "content": command_response}
+                    if queued_visible_user_msg:
+                        state.messages.append(assistant_msg)
+                    else:
+                        state.messages.extend([user_msg, assistant_msg])
+                    persist_thread_media_state(state.thread_id, state.messages)
+                    state.cache_active_messages()
+                    if not queued_visible_user_msg:
+                        cb.add_chat_message(user_msg)
+                    cb.add_chat_message(assistant_msg)
+                    touch_thread(state.thread_id)
+                    try:
+                        cb.rebuild_main()
+                    except TypeError:
+                        pass
+                    return
 
     # ── Snapshot & clear attached files immediately ──────────────────
-    _files_snapshot: list[dict] = list(p.pending_files)
+    _files_snapshot: list[dict] = [] if internal_goal_continuation else list(p.pending_files)
     file_names: list[str] = [f["name"] for f in _files_snapshot]
     if _files_snapshot:
         p.pending_files.clear()
@@ -1966,10 +2909,11 @@ async def send_message(
     user_msg: dict = {"role": "user", "content": display_content}
     if user_images:
         user_msg["images"] = user_images
-    state.messages.append(user_msg)
-    persist_thread_media_state(state.thread_id, state.messages)
-    state.cache_active_messages()
-    cb.add_chat_message(user_msg)
+    if not queued_visible_user_msg and not internal_goal_continuation:
+        state.messages.append(user_msg)
+        persist_thread_media_state(state.thread_id, state.messages)
+        state.cache_active_messages()
+        cb.add_chat_message(user_msg)
 
     auth_block_message = None
     try:
@@ -1988,7 +2932,11 @@ async def send_message(
         touch_thread(state.thread_id)
         return
 
-    if getattr(state, "active_developer_workspace_id", None) and not _files_snapshot:
+    if (
+        not internal_goal_continuation
+        and getattr(state, "active_developer_workspace_id", None)
+        and not _files_snapshot
+    ):
         try:
             from row_bot.developer.agent_context import maybe_answer_workspace_identity
 
@@ -2059,10 +3007,10 @@ async def send_message(
                 logger.debug("Processing note cleanup failed", exc_info=True)
 
     # ── Build agent input ────────────────────────────────────────────
-    agent_input = text
+    agent_input = goal_agent_input_override or text
     if file_context:
         marked_file_context = wrap_attachment_context(file_context)
-        agent_input = f"{marked_file_context}\n\n{text}" if text else marked_file_context
+        agent_input = f"{marked_file_context}\n\n{agent_input}" if agent_input else marked_file_context
     developer_context = ""
     if getattr(state, "active_developer_workspace_id", None):
         try:
@@ -2079,7 +3027,7 @@ async def send_message(
                 file_names, len(file_context), len(agent_input))
 
     # Auto-name thread
-    if should_auto_rename_thread(state.thread_id, state.thread_name):
+    if not internal_goal_continuation and should_auto_rename_thread(state.thread_id, state.thread_name):
         state.thread_name = rename_thread(
             state.thread_id,
             f"\U0001f4bb {display_content[:50]}",
@@ -2131,6 +3079,7 @@ async def send_message(
         if not await _agent_ready_forced_surface(_thread_mo or get_current_model(), runtime_surface):
             return
     recursion_limit = recursion_limit_for_mode(is_developer=is_developer)
+    profile_runtime_config = await run.io_bound(_profile_runtime_config_for_thread, gen_thread_id)
     config = {
         "configurable": {
             "thread_id": gen_thread_id,
@@ -2138,9 +3087,11 @@ async def send_message(
             "runtime_mode": runtime_mode,
             "generation_id": generation_id,
             "approval_mode": _thread_approval_mode,
+            **({"internal_goal_continuation": True} if internal_goal_continuation else {}),
             **({"model_override": _thread_mo} if _thread_mo else {}),
             **({"developer_workspace_id": state.active_developer_workspace_id} if getattr(state, "active_developer_workspace_id", None) else {}),
             **({"developer_context": developer_context} if developer_context else {}),
+            **profile_runtime_config,
         },
         "recursion_limit": recursion_limit,
     }
@@ -2171,9 +3122,10 @@ async def send_message(
         config=config,
         enabled_tools=enabled_tools,
         generation_id=generation_id,
+        queued_message_ids=list(queued_message_ids or []),
         voice_mode=voice_mode,
         tts_active=voice_mode and (state.tts_service.enabled or state.voice_coordinator.transport == "realtime"),
-        tts_allow_long=voice_mode and user_requested_read_aloud(text),
+        tts_allow_long=voice_mode and not internal_goal_continuation and user_requested_read_aloud(text),
     )
     if voice_mode and state.voice_coordinator.transport == "realtime":
         realtime_call = state.voice_coordinator.consume_realtime_tool_call()
@@ -2320,6 +3272,30 @@ async def resume_after_interrupt(
         logger.debug("Developer approval container clear after resume failed", exc_info=True)
 
     gen_thread_id = state.thread_id
+    if gen_thread_id:
+        try:
+            from row_bot import goals
+
+            waiting_goal = await run.io_bound(
+                lambda: goals.get_current_goal(gen_thread_id, include_terminal=True)
+            )
+            if waiting_goal and str(waiting_goal.get("status") or "") == "waiting_approval":
+                if approved:
+                    await run.io_bound(lambda: goals.resume_goal(gen_thread_id))
+                else:
+                    await run.io_bound(
+                        lambda: goals.block_goal(
+                            gen_thread_id,
+                            reason="Approval was denied by the user.",
+                        )
+                    )
+                _schedule_goal_strip_refresh(cb)
+                try:
+                    cb.rebuild_main()
+                except TypeError:
+                    pass
+        except Exception:
+            logger.debug("Goal approval state transition failed", exc_info=True)
     try:
         emit_buddy_event(
             BuddyEventType.APPROVAL_APPROVED if approved else BuddyEventType.APPROVAL_DENIED,
@@ -2535,7 +3511,8 @@ def _build_assistant_placeholder(gen: GenerationState, p: P) -> None:
     _ph_avatar = get_bot_avatar_html()
     _ph_name = get_assistant_name()
     with p.chat_container:
-        with ui.element("div").classes("row-bot-msg-row"):
+        with ui.element("div").classes("row-bot-msg-row") as _live_row:
+            gen.live_row = _live_row
             ui.html(
                 f'<div class="row-bot-avatar row-bot-avatar-bot">{_ph_avatar}</div>',
                 sanitize=False,

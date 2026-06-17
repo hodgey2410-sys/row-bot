@@ -22,7 +22,7 @@ from nicegui import events, run, ui
 
 from row_bot.ui.state import AppState, P, _active_generations
 from row_bot.ui.constants import ALLOWED_UPLOAD_SUFFIXES, welcome_message, EXAMPLE_PROMPTS
-from row_bot.ui.render import render_image_with_save
+from row_bot.ui.render import render_agent_tool_results, render_image_with_save
 from row_bot.ui.performance import log_ui_perf
 from row_bot.ui.timer_utils import defer_ui
 from row_bot.ui.transcript import (
@@ -72,6 +72,27 @@ def build_chat(
     from row_bot.ui.helpers import attach_thinking_to_message, persist_thread_media_state
     from row_bot.ui.thread_actions import show_rename_thread_dialog
 
+    def _render_parent_agent_strip() -> None:
+        from row_bot.ui.agent_drawer import build_parent_agent_drawer
+
+        build_parent_agent_drawer(
+            state,
+            p,
+            rebuild_main=rebuild_main,
+            rebuild_thread_list=rebuild_thread_list,
+        )
+
+    def _render_goal_progress_panel() -> str | None:
+        from row_bot.ui.goal_ui import build_goal_progress_panel
+
+        return build_goal_progress_panel(
+            state,
+            p,
+            rebuild_main=rebuild_main,
+            send_message=send_message,
+            surface="main",
+        )
+
     # Header
     _header_started = time.perf_counter()
     running_wfs = get_running_tasks()
@@ -106,6 +127,16 @@ def build_chat(
                             rebuild_main=rebuild_main,
                         ),
                     ).props("flat dense round size=sm").tooltip("Rename")
+                    from row_bot.ui.profile_picker import build_profile_picker
+
+                    build_profile_picker(
+                        state,
+                        p=p,
+                        rebuild_main=rebuild_main,
+                        rebuild_thread_list=rebuild_thread_list,
+                        label="Profile",
+                        surface="chat",
+                    )
 
             # Model selection now lives in the composer, matching Designer.
 
@@ -264,6 +295,32 @@ def build_chat(
     p.model_banner_container = ui.column().classes("w-full gap-0")
     _render_model_banner(_surface)
     defer_ui(_resolve_and_render_model_surface, delay=0.05)
+    p.parent_agent_strip_container = ui.column().classes("w-full gap-0")
+
+    def _refresh_parent_agent_strip() -> None:
+        if p.parent_agent_strip_container is None:
+            return
+        try:
+            p.parent_agent_strip_container.clear()
+            with p.parent_agent_strip_container:
+                _render_parent_agent_strip()
+        except Exception:
+            logger.debug("Could not refresh parent Agent strip", exc_info=True)
+
+    p.refresh_parent_agent_strip = _refresh_parent_agent_strip
+    _refresh_parent_agent_strip()
+
+    def _refresh_goal_strip() -> None:
+        if p.goal_strip_container is None:
+            return
+        try:
+            p.goal_strip_container.clear()
+            with p.goal_strip_container:
+                _render_goal_progress_panel()
+        except Exception:
+            logger.debug("Could not refresh Goal strip", exc_info=True)
+
+    p.refresh_goal_strip = _refresh_goal_strip
 
     # Scrollable message area
     p.chat_scroll = ui.scroll_area().classes("w-full flex-grow").style(_surface["scroll_style"])
@@ -356,8 +413,24 @@ def build_chat(
                             sanitize=False,
                         )
                         _reattach_gen.tool_col = ui.column().classes("w-full gap-1")
-                        from row_bot.ui.tool_trace import display_tool_content, group_tool_results, tool_result_failed
-                        for _group in group_tool_results(_reattach_gen.tool_results):
+                        from row_bot.ui.tool_trace import (
+                            display_tool_content,
+                            group_tool_results,
+                            is_agent_tool_result,
+                            tool_result_failed,
+                        )
+                        _agent_tool_results = [
+                            _tr for _tr in _reattach_gen.tool_results
+                            if isinstance(_tr, dict) and is_agent_tool_result(_tr)
+                        ]
+                        _generic_tool_results = [
+                            _tr for _tr in _reattach_gen.tool_results
+                            if not (isinstance(_tr, dict) and is_agent_tool_result(_tr))
+                        ]
+                        if _agent_tool_results:
+                            with _reattach_gen.tool_col:
+                                render_agent_tool_results(_agent_tool_results, thread_id=state.thread_id)
+                        for _group in group_tool_results(_generic_tool_results):
                             _group_failed = any(tool_result_failed(_tr) for _tr in _group.results)
                             with _reattach_gen.tool_col:
                                 with ui.expansion(
@@ -410,6 +483,7 @@ def build_chat(
                         _reattach_gen.thinking_label = None
                         _reattach_gen.thinking_md = None
             _reattach_gen.detached = False
+            _refresh_parent_agent_strip()
             if p.stop_btn:
                 p.stop_btn.enable()
         elif _reattach_gen and _reattach_gen.status in ("done", "error", "stopped", "interrupted"):
@@ -677,6 +751,10 @@ def build_chat(
             await ui.run_javascript(
                 f"document.getElementById('c{_hidden_upload.id}').querySelector('input[type=file]').click()"
             )
+
+    p.goal_strip_container = ui.column().classes("w-full shrink-0 gap-0 row-bot-goal-strip-slot")
+    p.goal_strip_refresh_timer = ui.timer(2.0, _refresh_goal_strip)
+    _refresh_goal_strip()
 
     with ui.column().classes("w-full shrink-0 gap-0").style(
         "border: 1px solid rgba(255,255,255,0.15); border-radius: 18px; "
@@ -1174,6 +1252,28 @@ def build_chat(
                     from row_bot.tools.row_bot_status_tool import _row_bot_status
 
                     _append_system_result("Tools", _row_bot_status("tools"))
+                    return
+                if spec.handler_key == "profiles":
+                    _remove_token_and_close()
+                    from row_bot.agent_commands import format_agent_profiles
+
+                    _append_system_result("Agent Profiles", format_agent_profiles(), icon="badge")
+                    return
+                if spec.handler_key == "profile":
+                    _replace_token_with_prefix("/profile ")
+                    return
+                if spec.handler_key == "agents":
+                    _remove_token_and_close()
+                    from row_bot.agent_commands import format_agents_status
+
+                    _append_system_result(
+                        "Agents",
+                        format_agents_status(parent_thread_id=state.thread_id),
+                        icon="hub",
+                    )
+                    return
+                if spec.handler_key == "goal":
+                    _replace_token_with_prefix("/goal ")
                     return
                 if spec.handler_key == "help":
                     _remove_token_and_close()

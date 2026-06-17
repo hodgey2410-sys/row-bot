@@ -444,6 +444,16 @@ async def _run_startup_sequence():
             "Run launcher.py --reset-tasks-db if it does not recover after restart."
         )
 
+    _set("Recovering Agent runs...")
+    try:
+        from row_bot.agent_runs import recover_stale_agent_runs
+
+        recovery = await asyncio.to_thread(recover_stale_agent_runs)
+        if any(int(value or 0) for value in recovery.values()):
+            logger.info("Agent Run startup recovery: %s", recovery)
+    except Exception as exc:
+        logger.warning("Agent Run startup recovery skipped (non-fatal): %s", exc)
+
     try:
         from row_bot.providers.model_catalog_cache import schedule_model_catalog_refresh_jobs
         await asyncio.to_thread(schedule_model_catalog_refresh_jobs)
@@ -540,6 +550,11 @@ async def _run_startup_sequence():
             if tunnel_manager.is_available():
                 tunnel_manager.start_tunnel(_APP_PORT, label="main_app")
                 _safe_console_print(f"[startup] ✅ Main-app tunnel auto-started on port {_APP_PORT}")
+            else:
+                _status_code, status_detail = tunnel_manager.status()
+                warning = f"Tunnel auto-start skipped: {status_detail}"
+                logger.warning(warning)
+                _st.startup_warnings.append(f"⚠️ {warning}")
         except Exception as exc:
             _st.startup_warnings.append(f"⚠️ Tunnel failed to auto-start: {exc}")
 
@@ -786,6 +801,20 @@ async def index():
     # ── Global panel card style ──────────────────────────────────────────
     ui.add_head_html("""
     <style>
+    :root {
+        --row-bot-left-drawer-width: 280px;
+        --row-bot-command-center-width: 440px;
+    }
+    .row-bot-main-shell {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        overflow: hidden;
+    }
+    .row-bot-main-card {
+        box-sizing: border-box;
+    }
     .row-bot-panel-card {
         border: 1px solid rgba(255,255,255,0.07) !important;
         box-shadow: 4px 0 16px rgba(0,0,0,0.45),
@@ -807,6 +836,12 @@ async def index():
                     inset 0 -1px 0 rgba(0,0,0,0.12),
                     0 3px 10px rgba(0,0,0,0.35),
                     0 1px 3px rgba(0,0,0,0.2);
+    }
+    @media (max-width: 900px) {
+        .row-bot-main-shell {
+            width: 100%;
+            max-width: 100%;
+        }
     }
     </style>
     """)
@@ -919,9 +954,22 @@ async def index():
     def _open_export():
         open_export(state, p)
 
-    def _send_message(text: str, voice_mode: bool = False):
-        mark_user_activity("send message")
-        return send_message(text, state=state, p=p, cb=cb, voice_mode=voice_mode)
+    def _send_message(
+        text: str,
+        voice_mode: bool = False,
+        *,
+        internal_goal_continuation: bool = False,
+    ):
+        if not internal_goal_continuation:
+            mark_user_activity("send message")
+        return send_message(
+            text,
+            state=state,
+            p=p,
+            cb=cb,
+            voice_mode=voice_mode,
+            internal_goal_continuation=internal_goal_continuation,
+        )
 
     async def _send_active_voice_message(text: str, *, voice_mode: bool = False):
         binding = getattr(p, "active_voice_binding", None)
@@ -989,16 +1037,20 @@ async def index():
     from row_bot.ui.terminal_widget import build_terminal_panel
     from row_bot.tools import registry as _tool_registry
 
-    _outer = ui.column().classes("w-full max-w-7xl mx-auto px-4 no-wrap row-bot-panel-card").style(
-        "height: calc(100vh - 16px); overflow: hidden; padding-bottom: 12px;"
-        " border-radius: 12px; margin-top: 8px;"
-    )
-    with _outer:
-        p.main_col = ui.column().classes("w-full no-wrap flex-grow").style(
-            "overflow: hidden;"
+    _main_shell = ui.element("div").classes("row-bot-main-shell")
+    with _main_shell:
+        _outer = ui.column().classes(
+            "w-full max-w-7xl mx-auto px-4 no-wrap row-bot-panel-card row-bot-main-card"
+        ).style(
+            "height: calc(100vh - 16px); overflow: hidden; padding-bottom: 12px;"
+            " border-radius: 12px; margin-top: 8px;"
         )
+        with _outer:
+            p.main_col = ui.column().classes("w-full no-wrap flex-grow").style(
+                "overflow: hidden;"
+            )
         # Terminal panel — inline, pushes chat content up when expanded
-        build_terminal_panel(p, state, _tool_registry)
+            build_terminal_panel(p, state, _tool_registry)
 
     # ── Command Center (right drawer) ───────────────────────────────
     build_command_center(
@@ -1007,6 +1059,7 @@ async def index():
         rebuild_thread_list=rebuild_thread_list,
         show_task_dialog=_show_task_dialog,
         load_thread_messages=load_thread_messages,
+        open_settings=_open_settings,
     )
     from row_bot.ui.buddy import build_in_app_buddy
     build_in_app_buddy()
@@ -1073,6 +1126,8 @@ async def index():
                         add_chat_message=lambda msg: add_chat_message(msg, p, state.thread_id),
                         browse_file=browse_file,
                         open_settings=_open_settings,
+                        rebuild_main=lambda **kw: _rebuild_main(**kw),
+                        rebuild_thread_list=rebuild_thread_list,
                     )
                 elif state.active_developer_workspace_id is not None:
                     from row_bot.developer.ui import build_developer_workspace
@@ -1252,6 +1307,16 @@ async def index():
     cb.add_chat_message = _add_chat_message_and_track
     cb.mark_chat_message_rendered = _mark_chat_message_rendered
     cb.render_text_with_embeds = render_text_with_embeds
+    cb.refresh_parent_agent_strip = lambda: (
+        p.refresh_parent_agent_strip()
+        if callable(getattr(p, "refresh_parent_agent_strip", None))
+        else None
+    )
+    cb.refresh_goal_strip = lambda: (
+        p.refresh_goal_strip()
+        if callable(getattr(p, "refresh_goal_strip", None))
+        else None
+    )
 
     def _refresh_chat_messages() -> None:
         """Synchronize the active transcript without a full visible rebuild."""

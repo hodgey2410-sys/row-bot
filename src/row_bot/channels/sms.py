@@ -36,6 +36,7 @@ from row_bot.channels.auth_store import get_channel_secret
 from row_bot.channels import commands as ch_commands
 from row_bot.channels import auth as ch_auth
 from row_bot.channels import config as ch_config
+from row_bot.channels import runtime as ch_runtime
 from row_bot.threads import _save_thread_meta
 
 log = logging.getLogger("row_bot.sms")
@@ -389,6 +390,31 @@ async def _handle_inbound_sms(request) -> Any:
         if ch_commands.is_thread_scoped_command(body)
         else None
     )
+    goal_start = ch_runtime.prepare_channel_goal_start(body, _cmd_thread_id)
+    if goal_start is not None and _cmd_thread_id:
+        config = {"configurable": {"thread_id": _cmd_thread_id}}
+        _send_reply(from_number, ch_runtime.format_goal_started_ack(goal_start))
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: ch_runtime.run_channel_goal_sync(
+                channel_name="sms",
+                thread_id=_cmd_thread_id,
+                config=config,
+                first_prompt=goal_start.prompt,
+                run_turn=lambda prompt, cfg: _run_agent_sync(prompt, cfg),
+                send_text=lambda message: _send_reply(from_number, message),
+            ),
+        )
+        if result.interrupt_data:
+            with _pending_lock:
+                _pending_interrupts[from_number] = {
+                    "data": result.interrupt_data, "config": config
+                }
+            from row_bot.channels import approval as approval_helpers
+            detail = approval_helpers.format_interrupt_text(result.interrupt_data)
+            _send_reply(from_number, detail + "\nReply YES or NO.")
+        return Response("<Response/>", media_type=_XML)
     cmd_response = ch_commands.dispatch("sms", body, thread_id=_cmd_thread_id)
     if cmd_response is not None:
         _send_reply(from_number, cmd_response)
@@ -437,6 +463,7 @@ async def _handle_inbound_sms(request) -> Any:
         interrupt_ids = approval_helpers.extract_interrupt_ids(
             interrupt.get("data")
         )
+        ch_runtime.resolve_goal_approval_for_config(config, approved)
 
         loop = asyncio.get_event_loop()
         answer, new_interrupt, _ = await loop.run_in_executor(
@@ -454,6 +481,28 @@ async def _handle_inbound_sms(request) -> Any:
                 }
             detail = approval_helpers.format_interrupt_text(new_interrupt)
             _send_reply(from_number, detail + "\nReply YES or NO.")
+        elif answer:
+            thread_id = ch_runtime.thread_id_from_config(config)
+            if thread_id:
+                goal_result = await loop.run_in_executor(
+                    None,
+                    lambda: ch_runtime.continue_channel_goal_after_turn_sync(
+                        channel_name="sms",
+                        thread_id=thread_id,
+                        config=config,
+                        assistant_text=answer,
+                        interrupt_data=None,
+                        run_turn=lambda prompt, cfg: _run_agent_sync(prompt, cfg),
+                        send_text=lambda message: _send_reply(from_number, message),
+                    ),
+                )
+                if goal_result.interrupt_data:
+                    with _pending_lock:
+                        _pending_interrupts[from_number] = {
+                            "data": goal_result.interrupt_data, "config": config
+                        }
+                    detail = approval_helpers.format_interrupt_text(goal_result.interrupt_data)
+                    _send_reply(from_number, detail + "\nReply YES or NO.")
         return Response("<Response/>", media_type=_XML)
 
     # Normal message
@@ -564,12 +613,19 @@ async def start_bot() -> bool:
                 from row_bot.tunnel import tunnel_manager
                 # Use the main-app tunnel rather than a
                 # dedicated SMS port — avoids the ngrok one-tunnel limit.
-                public_url = tunnel_manager.get_url(get_app_port())
+                app_port = get_app_port()
+                public_url = tunnel_manager.get_url(app_port)
+                if not public_url and tunnel_manager.is_available():
+                    log.info("SMS starting shared main-app tunnel on port %s", app_port)
+                    public_url = tunnel_manager.start_tunnel(app_port, label="sms")
+                    ch_config.set("tunnel", "tunnel_main_app", True)
                 if public_url:
                     _webhook_public_url = public_url
                     log.info("SMS using main-app tunnel: %s/sms", public_url)
                     _auto_register_twilio_webhook(public_url)
                 else:
+                    _status_code, detail = tunnel_manager.status()
+                    log.warning("SMS tunnel enabled but unavailable: %s", detail)
                     log.info(
                         "Main-app tunnel not active — enable 'Expose task "
                         "webhook endpoint' in Settings → System → Tunnel "
@@ -577,6 +633,9 @@ async def start_bot() -> bool:
                     )
                     _webhook_public_url = None
             except ImportError:
+                _webhook_public_url = None
+            except Exception as exc:
+                log.error("SMS failed to open shared main-app tunnel: %s", exc)
                 _webhook_public_url = None
         else:
             _webhook_public_url = None
