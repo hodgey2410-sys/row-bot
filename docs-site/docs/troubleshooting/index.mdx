@@ -1,26 +1,19 @@
 ---
-title: Troubleshooting
-description: Troubleshoot Row-Bot installation, startup, models, providers, tools, channels, MCP, plugins, and voice.
+title: "Troubleshooting"
+description: "Resolve common setup, model, data, documents, channels, MCP, plugin, and capture issues safely."
 ---
 
 # Troubleshooting
 
-This section will combine curated troubleshooting guides with generated
-diagnostic reference from Row-Bot status checks and setup metadata.
+Start with the visible status text in the app shell, Setup Center, Settings tabs, and Monitor tab. Then check the local logs under the active data directory.
 
-Initial categories:
+## Common Checks
 
-- installation and startup;
-- model/provider readiness;
-- local Ollama;
-- custom endpoints;
-- documents and embeddings;
-- browser automation;
-- workflows;
-- channels;
-- voice;
-- MCP;
-- plugins;
-- updates.
+- Model unavailable: open Settings > Providers and Settings > Models.
+- Documents not searchable: open Settings > Documents and check indexing state.
+- Workflows not running: open Home > Workflows and verify delivery defaults and approvals.
+- Channels disconnected: open Settings > Channels and keep credentials masked.
+- MCP or plugins unsafe: keep servers/plugins disabled until reviewed.
+- Voice unavailable: open Settings > Voice and confirm provider and microphone/runtime settings.
 
-When in doubt, check the Row-Bot status bar and Settings diagnostics first.
+Never paste real credentials into screenshots, docs fixtures, or review artifacts.

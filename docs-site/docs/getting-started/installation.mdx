@@ -1,58 +1,16 @@
 ---
-title: Installation
-description: Install Row-Bot on Windows, macOS, or Linux.
+title: "Installation"
+description: "Install Row-Bot and identify the local data directory used by the app."
 ---
 
 # Installation
 
-Download the latest installer from the Row-Bot GitHub releases page:
+Install Row-Bot from the release package for your platform, or run it from source with the Python dependencies installed. The app starts a local NiceGUI server and opens a browser or native window depending on launch settings.
 
-https://github.com/siddsachar/row-bot/releases/latest
+## Data Directory
 
-## Windows
+Row-Bot keeps local app data in the active Row-Bot data directory. Set `ROW_BOT_DATA_DIR` to isolate test, review, or portable runs. The docs capture flow always uses a temporary data directory and generated demo files.
 
-1. Download the latest Windows installer.
-2. Run the installer.
-3. Launch Row-Bot from the Start Menu or desktop shortcut.
+## After Install
 
-Row-Bot preserves user data under the Row-Bot data directory while upgrades
-replace the bundled runtime and application files.
-
-## macOS
-
-1. Download the latest macOS DMG.
-2. Drag `Row-Bot.app` into Applications.
-3. Launch Row-Bot from Applications or Launchpad.
-
-The first launch may ask you to confirm the app because it was downloaded from
-the internet.
-
-## Linux
-
-Run the one-line installer:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/siddsachar/row-bot/main/installer/install-linux.sh | bash
-```
-
-The Linux installer places Row-Bot under your user account and creates the
-`row-bot` command when `~/.local/bin` is on your `PATH`.
-
-## From Source
-
-Source installs are useful for contributors and advanced users:
-
-```bash
-git clone https://github.com/siddsachar/row-bot.git
-cd row-bot
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
-
-On Windows PowerShell, activate the virtual environment with:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+Open Row-Bot, complete the first model setup path, then use the Setup Center for documents, workflows, Designer, Developer, channels, accounts, MCP, plugins, and voice.

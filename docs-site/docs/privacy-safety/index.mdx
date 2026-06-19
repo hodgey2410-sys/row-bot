@@ -1,27 +1,16 @@
 ---
-title: Privacy And Safety
-description: Understand Row-Bot's local-first data model and safety controls.
+title: "Privacy And Safety"
+description: "Understand local/external boundaries, approvals, credentials, and safe capture behavior."
 ---
 
 # Privacy And Safety
 
-Row-Bot is local-first. Durable app data such as conversations, memories,
-documents, graph data, workflows, logs, settings, skills, plugins, and local
-workspace references stays on your machine by default.
+Row-Bot separates local UI state from external provider, account, channel, MCP, plugin, shell, browser, and filesystem actions. Sensitive operations can require approval, and credential controls are masked.
 
-Provider and custom-model calls are opt-in. When a provider model is selected,
-the active conversation, model-visible context, and tool results needed for
-that turn are sent to the selected provider or endpoint.
+## Docs Capture Safety
 
-Safety controls include:
+Public docs screenshots are captured from the real NiceGUI app route with `ROW_BOT_DOCS_CAPTURE=1`, a temporary `ROW_BOT_DATA_DIR`, fixed time, reduced motion, fake provider readiness, disabled autostart, and no real credentials.
 
-- approval prompts for destructive actions;
-- filesystem boundaries;
-- shell command classification;
-- workflow safety modes;
-- MCP destructive-tool classification;
-- plugin sandboxing;
-- Developer Studio approval modes and optional Docker shadow workspace.
+## Approval Examples
 
-This page should be reviewed carefully whenever generated privacy or provider
-reference content changes.
+Approval screenshots are deferred until a deterministic pending-interrupt fixture exists. The docs still describe the behavior: file writes, shell commands, browser automation, MCP tools, Developer edits, and external actions can ask before continuing or be blocked by policy.

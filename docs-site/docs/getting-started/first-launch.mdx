@@ -1,29 +1,38 @@
 ---
-title: First Launch Setup
-description: Understand Row-Bot's first launch wizard and model setup paths.
+title: "First Launch"
+description: "Use the real first-run wizard and Setup Center."
 ---
 
-# First Launch Setup
+import Screenshot from '@site/src/components/Screenshot';
 
-On first launch, Row-Bot opens a setup wizard. The wizard helps you choose how
-the assistant should run models and which setup areas you want to finish next.
+# First Launch
+
+The first-run wizard appears until `setup_complete` is saved in the app config. It asks you to connect one working model path first; every other feature can be configured later.
+
+
+<Screenshot id="first-launch-setup-wizard" alt="Row-Bot first launch wizard." caption="The real first-launch wizard with local, API provider, and custom endpoint paths." />
 
 ## Model Paths
 
-Row-Bot supports several model paths:
+- Local Ollama keeps model inference on the machine when Ollama and the chosen model are available.
+- API providers require credentials and send prompts to the selected provider.
+- Custom endpoints can be local or remote OpenAI-compatible servers; the endpoint location determines the privacy boundary.
 
-- local models through Ollama;
-- hosted provider API keys;
-- subscription-backed providers such as ChatGPT / Codex and Claude
-  Subscription;
-- custom OpenAI-compatible endpoints such as LM Studio, vLLM, llama.cpp,
-  LocalAI, LiteLLM, and SGLang.
 
-## Setup Center
+<Screenshot id="setup-center" alt="Row-Bot Setup Center." caption="The real Setup Center for optional post-model setup." />
 
-After model setup, the setup center can guide you through documents, workflows,
-Designer Studio, Developer Studio, channels, accounts, tools, plugins, MCP, and
-voice.
+## What Is Saved
 
-The public docs screenshot pipeline will capture this flow from a deterministic
-demo app state so users can preview it before installing.
+Setup progress is saved in app config, including completed and skipped Setup Center steps.
+
+## Local And External Behavior
+
+Local setup choices can stay entirely on the machine when using local models and local files.
+
+API providers, account integrations, channels, MCP servers, and plugins can contact external services only after you configure and start them.
+
+## Credentials And Safety
+
+Credential fields are password-style controls. Docs screenshots use fake demo state and mask sensitive inputs.
+
+Actions that can change files, call external systems, start servers, or use MCP tools follow the active approval policy. When a surface is disconnected or empty, Row-Bot keeps the controls visible so you can see what still needs setup.
