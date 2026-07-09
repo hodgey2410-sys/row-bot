@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
+import httpx
 import pytest
 
 import row_bot.models as models
@@ -507,6 +508,7 @@ def test_phase4_opencode_responses_runtime_keeps_v1_base_url(monkeypatch):
     assert model.kwargs["base_url"] == "https://opencode.ai/zen/v1"
     assert model.kwargs["use_responses_api"] is True
     assert model.kwargs["output_version"] == "responses/v1"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_phase4_opencode_anthropic_runtime_strips_v1(monkeypatch):
@@ -525,6 +527,7 @@ def test_phase4_opencode_anthropic_runtime_strips_v1(monkeypatch):
     assert model.kwargs["model"] == "minimax-m2.7"
     assert model.kwargs["api_key"] == "go-key"
     assert model.kwargs["base_url"] == "https://opencode.ai/zen/go"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_phase4_opencode_gemini_runtime_is_blocked(monkeypatch):

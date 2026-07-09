@@ -2,6 +2,7 @@ import sys
 import socket
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 
 import row_bot.providers.runtime as runtime
@@ -28,6 +29,7 @@ def test_openai_gpt5_family_uses_responses_api(monkeypatch):
     assert model.kwargs["model"] == "gpt-5.5-pro"
     assert model.kwargs["use_responses_api"] is True
     assert model.kwargs["output_version"] == "responses/v1"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_openai_legacy_chat_model_keeps_chat_completions_path(monkeypatch):
@@ -41,6 +43,7 @@ def test_openai_legacy_chat_model_keeps_chat_completions_path(monkeypatch):
 
     assert model.kwargs["model"] == "gpt-4o"
     assert "use_responses_api" not in model.kwargs
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_anthropic_provider_constructor_is_preserved(monkeypatch):
@@ -58,6 +61,7 @@ def test_anthropic_provider_constructor_is_preserved(monkeypatch):
 
     assert model.kwargs["model"] == "claude-sonnet-4-5"
     assert model.kwargs["api_key"] == "anthropic-key"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_google_provider_constructor_is_preserved(monkeypatch):
@@ -92,6 +96,7 @@ def test_xai_provider_constructor_is_preserved(monkeypatch):
 
     assert model.kwargs["model"] == "grok-4"
     assert model.kwargs["api_key"] == "xai-key"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
 
 
 def test_openrouter_provider_constructor_is_preserved(monkeypatch):
@@ -737,6 +742,7 @@ def test_minimax_provider_creates_chat_anthropic_with_minimax_base_url(monkeypat
 
     assert model.kwargs["model"] == "MiniMax-M2.7"
     assert model.kwargs["api_key"] == "test-minimax-key"
+    assert isinstance(model.kwargs["http_client"], httpx.Client)
     assert model.kwargs["base_url"] == "https://api.minimax.io/anthropic"
 
 
