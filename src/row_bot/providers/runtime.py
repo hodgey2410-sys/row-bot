@@ -332,14 +332,12 @@ def create_chat_model(model_name: str, provider_id: str | None = None):
                 http_client=cancellable_http_client(),
             )
         if transport == "anthropic_messages" or transport.value == "anthropic_messages":
-            from langchain_anthropic import ChatAnthropic
-            from row_bot.providers.transports.cancellable_http import cancellable_http_client
+            from row_bot.providers.transports.anthropic_cancellable import CancellableChatAnthropic
 
-            return ChatAnthropic(
+            return CancellableChatAnthropic(
                 model=model_name,
                 api_key=api_key,
                 base_url=opencode_anthropic_base_url(provider),
-                http_client=cancellable_http_client(),
             )
         raise OpenCodeUnsupportedRouteError(
             f"OpenCode route for {provider_label} model '{model_name}' uses unsupported/deferred transport {transport.value}."
@@ -415,12 +413,11 @@ def create_chat_model(model_name: str, provider_id: str | None = None):
             kwargs.update({"use_responses_api": True, "output_version": "responses/v1"})
         return ChatOpenAI(**kwargs)
     if provider == "anthropic":
-        from langchain_anthropic import ChatAnthropic
-        from row_bot.providers.transports.cancellable_http import cancellable_http_client
+        from row_bot.providers.transports.anthropic_cancellable import CancellableChatAnthropic
         api_key = get_provider_secret("anthropic")
         if not api_key:
             raise ValueError("Anthropic API key not configured. Set it in Settings → Providers.")
-        return ChatAnthropic(model=model_name, api_key=api_key, http_client=cancellable_http_client())
+        return CancellableChatAnthropic(model=model_name, api_key=api_key)
     if provider == "google":
         from langchain_google_genai import ChatGoogleGenerativeAI
         api_key = get_provider_secret("google")
@@ -435,18 +432,16 @@ def create_chat_model(model_name: str, provider_id: str | None = None):
             raise ValueError("xAI API key not configured. Set it in Settings → Providers.")
         return ChatXAI(model=model_name, api_key=api_key, http_client=cancellable_http_client())
     if provider == "minimax":
-        from langchain_anthropic import ChatAnthropic
-        from row_bot.providers.transports.cancellable_http import cancellable_http_client
+        from row_bot.providers.transports.anthropic_cancellable import CancellableChatAnthropic
         api_key = get_provider_secret("minimax")
         if not api_key:
             raise ValueError("MiniMax API key not configured. Set it in Settings → Providers.")
         definition = get_provider_definition("minimax")
         api_url = definition.base_url if definition and definition.base_url else "https://api.minimax.io/anthropic"
-        return ChatAnthropic(
+        return CancellableChatAnthropic(
             model=model_name,
             api_key=api_key,
             base_url=api_url,
-            http_client=cancellable_http_client(),
         )
     if provider == "atlascloud":
         from row_bot.providers.transports.openai_compatible import ChatOpenAICompatible
@@ -490,11 +485,11 @@ def create_chat_model(model_name: str, provider_id: str | None = None):
             },
         )
 
-    from langchain_openrouter import ChatOpenRouter
+    from row_bot.providers.transports.openrouter_cancellable import CancellableChatOpenRouter
     api_key = get_provider_secret("openrouter")
     if not api_key:
         raise ValueError("OpenRouter API key not configured. Set it in Settings → Providers.")
-    return ChatOpenRouter(model_name=model_name, openrouter_api_key=api_key)
+    return CancellableChatOpenRouter(model_name=model_name, openrouter_api_key=api_key)
 
 
 def ensure_chat_model_compatible(model_name: str, provider_id: str | None = None) -> None:

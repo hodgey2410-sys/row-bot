@@ -1,9 +1,10 @@
+import asyncio
 import threading
 
 import httpx
 
 from row_bot.cancellation import CancellationScope, use_cancellation_scope
-from row_bot.providers.transports.cancellable_http import cancellable_http_client
+from row_bot.providers.transports.cancellable_http import cancellable_async_http_client, cancellable_http_client
 
 
 class _BlockingByteStream(httpx.SyncByteStream):
@@ -27,6 +28,18 @@ class _BlockingByteStream(httpx.SyncByteStream):
     def close(self) -> None:
         self.close_calls += 1
         self.closed.set()
+
+
+class _CloseCountingAsyncStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def __aiter__(self):
+        if False:
+            yield b""
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 def test_cancellable_http_client_closes_response_when_scope_is_cancelled():
@@ -89,3 +102,26 @@ def test_cancellable_http_client_preserves_caller_event_hooks():
     client.get("http://example.test/ping")
 
     assert seen == ["custom"]
+
+
+def test_cancellable_async_http_client_closes_response_when_scope_is_cancelled():
+    async def run_case() -> None:
+        client = cancellable_async_http_client()
+        stream = _CloseCountingAsyncStream()
+        response = httpx.Response(200, request=httpx.Request("GET", "http://example.test/stream"), stream=stream)
+        scope = CancellationScope()
+
+        try:
+            with use_cancellation_scope(scope):
+                for hook in client.event_hooks["response"]:
+                    await hook(response)
+
+            assert stream.close_calls == 0
+            scope.cancel("test")
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert stream.close_calls == 1
+        finally:
+            await client.aclose()
+
+    asyncio.run(run_case())
