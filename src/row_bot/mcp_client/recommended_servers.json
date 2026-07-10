@@ -293,6 +293,35 @@
     "install": {"transport": "streamable_http", "url": "https://mcp.slack.com/mcp"}
   },
   {
+    "id": "xquik-mcp",
+    "name": "Xquik MCP",
+    "description": "Search, extract, monitor, and automate X data and connected-account workflows through a remote MCP endpoint.",
+    "source": "curated",
+    "url": "https://github.com/Xquik-dev/x-twitter-scraper",
+    "publisher": "Xquik",
+    "classification": "official",
+    "category": "Social Media",
+    "trust_tier": "official_vendor",
+    "risk_level": "high",
+    "action_scope": "destructive_possible",
+    "transport": "streamable_http",
+    "requires_auth": true,
+    "recommended": false,
+    "capabilities": ["x", "social_media", "search", "monitoring", "webhooks", "publishing"],
+    "overlaps_native": ["x"],
+    "last_reviewed": "2026-07-10",
+    "notes": [
+      "Row-Bot already includes native X tools. Use this provider-specific surface only when it fits the workflow.",
+      "Configure the x-api-key header before testing. Xquik exposes a read-only explore tool plus one generic xquik executor for its wider API surface.",
+      "Keep the xquik executor approval-gated and confirm private reads, writes, persistent monitors or webhooks, and metered actions before use."
+    ],
+    "install": {
+      "transport": "streamable_http",
+      "url": "https://xquik.com/mcp",
+      "headers": {"x-api-key": ""}
+    }
+  },
+  {
     "id": "modelcontextprotocol-filesystem",
     "name": "Filesystem",
     "description": "Reference local file operations with configurable access controls.",
